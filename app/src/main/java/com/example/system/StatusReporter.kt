@@ -34,30 +34,30 @@ class StatusReporter(private val context: Context) {
     /**
      * 收集狀態並發送至伺服器 (非同步)
      */
-    fun sendHeartbeat(uploadCount: Int, currentInterval: Int = 60, isStopping: Boolean = false) {
-        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping)
+    fun sendHeartbeat(uploadCount: Int, currentInterval: Int = 60, isStopping: Boolean = false, isRestarting: Boolean = false) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting)
         postJsonToServer(jsonPayload)
     }
 
     /**
-     * 同步發送最後遺言 (確保在進程關閉前送達)
+     * 💥 同步發送最後遺言 (確保在進程關閉前送達)
      */
-    fun sendHeartbeatSync(uploadCount: Int, currentInterval: Int, isStopping: Boolean) {
-        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping)
+    fun sendHeartbeatSync(uploadCount: Int, currentInterval: Int, isStopping: Boolean = false, isRestarting: Boolean = false) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting)
         val body = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
         val request = Request.Builder().url(statusUrl).post(body).build()
 
         try {
             // 使用 execute() 而不是 enqueue()，強制等待結果
             client.newCall(request).execute().use { response ->
-                Log.w("StatusReporter", "💀 遺言已確實抵達伺服器，狀態碼: ${response.code}")
+                Log.w("StatusReporter", "💀 遺言已確實抵達伺服器, 狀態碼: ${response.code}")
             }
         } catch (e: Exception) {
             Log.e("StatusReporter", "💀 遺言發送失敗", e)
         }
     }
 
-    private fun createPayload(uploadCount: Int, interval: Int, isStopping: Boolean): String {
+    private fun createPayload(uploadCount: Int, interval: Int, isStopping: Boolean, isRestarting: Boolean): String {
         val batteryLevel = getBatteryLevel()
         val uptimeMinutes = (System.currentTimeMillis() - startTime) / (1000 * 60)
 
@@ -69,6 +69,7 @@ class StatusReporter(private val context: Context) {
             put("photoInterval", interval) // 伺服器依賴此 Key
             put("uptime", "${uptimeMinutes} 分鐘")
             put("isStopping", isStopping)
+            put("isRestarting", isRestarting) // 🌟 告訴 Web 我們要重啟了
         }.toString()
     }
 
@@ -138,6 +139,8 @@ class StatusReporter(private val context: Context) {
                     } catch (e: Exception) {
                         Log.e("StatusReporter", "❌ 發生未知的嚴重錯誤", e)
                     }
+                    @Suppress("UNUSED_EXPRESSION")
+                    Unit
                 }
             }
         })

