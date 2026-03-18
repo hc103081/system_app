@@ -4,6 +4,8 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.camera.core.*
@@ -11,6 +13,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
+import androidx.work.WorkManager
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -30,6 +33,8 @@ class MonitoringService : LifecycleService() {
     private lateinit var statusReporter: StatusReporter
     @Volatile private var successUploadCount = 0
     @Volatile private var currentPhotoInterval = 60 // 預設 60 秒
+    @Volatile private var isCapturing = false
+    @Volatile private var isShuttingDown = false
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var photoJob: Job? = null
@@ -61,81 +66,95 @@ class MonitoringService : LifecycleService() {
         startPhotoLoop()
     }
 
-    /** 處理遠端指令 (扁平化路由) */
     private fun handleRemoteCommand(command: String, value: String) {
+        Log.w(TAG, "🎯 開始執行遠端指令: $command, 參數: $value")
+        
         when (command) {
             "SET_INTERVAL" -> {
                 val newInterval = value.toIntOrNull()
-                if (newInterval == null || newInterval < 5) return
+                if (newInterval == null || newInterval < 5) {
+                    Log.e(TAG, "❌ 無效的頻率參數: $value")
+                    return
+                }
                 
-                Log.d(TAG, "🔄 收到指令：更改拍照頻率為 $newInterval 秒")
                 currentPhotoInterval = newInterval
-                startPhotoLoop() // 重啟拍照迴圈以套用新頻率
+                Log.d(TAG, "✅ 頻率已成功更新為: $currentPhotoInterval 秒")
+                startPhotoLoop() 
                 
-                // 主動發送一次心跳，讓 Server 立刻知道我們已套用
-                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval)
+                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, false)
             }
             "STOP_SERVICE" -> executeSelfDestruct()
             else -> Log.w(TAG, "未知指令: $command")
         }
     }
 
-    /** 拍照迴圈 (支援動態取消重啟) */
     private fun startPhotoLoop() {
         photoJob?.cancel()
         photoJob = serviceScope.launch {
+            while (imageCapture == null && isActive) {
+                Log.d(TAG, "⏳ 拍照任務等待中：相機尚未綁定...")
+                delay(2000L)
+            }
+
             while (isActive) {
                 if (isRunning) {
-                    Log.d(TAG, "定時觸發拍照...")
-                    takePhoto()
+                    takePhotoAndUpload()
                 }
                 delay(currentPhotoInterval * 1000L)
             }
         }
     }
 
-    /** 獨立的心跳包迴圈 (固定 60 秒回報一次) */
     private fun startHeartbeatLoop() {
         serviceScope.launch {
             while (isActive) {
                 Log.d(TAG, "💓 觸發獨立心跳包...")
                 statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval)
-                delay(60_000L)
+                delay(10_000L)
             }
         }
     }
 
-    /** 執行自毀程序 (最後遺言) */
     private fun executeSelfDestruct() {
-        Log.w(TAG, "🛑 收到自毀指令，準備發送最後狀態並停止...")
+        if (isShuttingDown) return
+        isShuttingDown = true
+        Log.w(TAG, "🛑 [自毀程序啟動] 收到遠端停止指令！")
         isRunning = false
         
-        // 1. 停止所有背景任務
+        photoJob?.cancel()
         serviceScope.cancel()
-        
-        // 2. 發送最後遺言
-        statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, isStopping = true)
-        
-        // 3. 延遲一下讓 Http 請求有時間送出，然後關閉 Service
-        GlobalScope.launch(Dispatchers.Main) {
-            delay(1500)
-            stopSelf()
-            // 取消 WorkManager 守護任務 (由 MainActivity 提供的工具或直接呼叫)
-            androidx.work.WorkManager.getInstance(applicationContext).cancelUniqueWork("MonitoringGuard")
-        }
-    }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        super.onStartCommand(intent, flags, startId)
-        Log.d(TAG, "服務啟動中...")
-        return START_STICKY
+        CoroutineScope(Dispatchers.IO).launch {
+            Log.w(TAG, "📤 正在同步發送最後遺言...")
+            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, true)
+
+            withContext(Dispatchers.Main) {
+                try {
+                    WorkManager.getInstance(applicationContext).cancelAllWork()
+                    
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
+                    
+                    wakeLock?.let { if (it.isHeld) it.release() }
+                    stopSelf()
+                    Log.w(TAG, "⚰️ 服務已成功呼叫 stopSelf()，等待系統回收")
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "清理程序發生異常", e)
+                }
+            }
+        }
     }
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-            imageCapture = ImageCapture.Builder()
+            val capture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .build()
 
@@ -143,33 +162,44 @@ class MonitoringService : LifecycleService() {
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, imageCapture)
-                Log.d(TAG, "CameraX 已綁定至服務生命週期")
+                cameraProvider.bindToLifecycle(this, cameraSelector, capture)
+                imageCapture = capture
+                Log.d(TAG, "✅ CameraX 已成功綁定至服務生命週期")
             } catch (exc: Exception) {
-                Log.e(TAG, "相機啟動失敗", exc)
+                Log.e(TAG, "❌ 相機啟動失敗", exc)
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    fun takePhoto() {
-        cleanUpOldFiles(cacheDir, 50)
-        val capture = imageCapture ?: run {
-            Log.w(TAG, "相機尚未就緒，跳過此次拍照")
+    private fun takePhotoAndUpload() {
+        if (isCapturing) {
+            Log.w(TAG, "⏳ 相機仍在處理上一張照片，跳過此次拍攝")
             return
         }
-        val photoFile = File(cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+        
+        val imageCapture = imageCapture ?: return
+        
+        cleanUpOldFiles(cacheDir, 50)
+        
+        isCapturing = true
+        Log.d(TAG, "📸 準備按下快門...")
+
+        val photoFile = File(cacheDir, "photo_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
 
-        capture.takePicture(
+        imageCapture.takePicture(
             outputOptions,
-            cameraExecutor,
+            ContextCompat.getMainExecutor(this),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    Log.d(TAG, "拍照成功: ${photoFile.absolutePath}")
+                    isCapturing = false
+                    Log.d(TAG, "✅ 拍照成功")
                     uploadToServer(photoFile)
                 }
+
                 override fun onError(exc: ImageCaptureException) {
-                    Log.e(TAG, "拍照失敗: ${exc.message}")
+                    isCapturing = false
+                    Log.e(TAG, "❌ 拍照失敗: ${exc.message}")
                 }
             }
         )
@@ -186,33 +216,16 @@ class MonitoringService : LifecycleService() {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "❌ 上傳失敗 | 檔案: ${file.name} | 目標: $serverUrl")
-                Log.e(TAG, "原因: ${e.message}")
-                
-                // 針對常見網路錯誤提供更具體的診斷 Log
-                when (e) {
-                    is java.net.UnknownHostException -> {
-                        Log.e(TAG, "診斷: 無法解析主機名 (DNS 失敗)。請檢查：1. 手機是否連網 2. 伺服器網址是否正確 3. 是否有防火牆阻擋")
-                    }
-                    is java.net.ConnectException -> {
-                        Log.e(TAG, "診斷: 連線被拒絕。請檢查：1. 伺服器是否已啟動 2. 伺服器防火牆是否開放 8080 端口 3. IP 是否正確")
-                    }
-                    is java.net.SocketTimeoutException -> {
-                        Log.e(TAG, "診斷: 連線逾時。請檢查：網路品質是否穩定，或伺服器處理太慢")
-                    }
-                    else -> {
-                        Log.e(TAG, "堆疊追蹤: ${Log.getStackTraceString(e)}")
-                    }
-                }
+                Log.e(TAG, "❌ 上傳失敗 | 檔案: ${file.name} | 原因: ${e.message}")
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use { 
                     if (it.isSuccessful) {
-                        Log.d(TAG, "上傳成功")
+                        Log.d(TAG, "🚀 上傳成功")
                         if (file.exists()) file.delete()
                         successUploadCount++
                     } else {
-                        Log.e(TAG, "上傳失敗，狀態碼: ${response.code} | 回應: ${it.body?.string()}")
+                        Log.e(TAG, "⚠️ 上傳失敗，狀態碼: ${it.code}")
                     }
                 }
             }
@@ -269,8 +282,17 @@ class MonitoringService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        Log.w(TAG, "⚠️ 服務即將銷毀 (onDestroy)")
+        if (!isShuttingDown) {
+            isShuttingDown = true
+            Log.w(TAG, "🛑 [本機中斷] 發送服務已中斷訊號給伺服器...")
+            Thread {
+                statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, true)
+            }.start()
+        }
         isRunning = false
         serviceScope.cancel()
+        photoJob?.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
         cameraExecutor.shutdown()
         Log.d(TAG, "服務已關閉")

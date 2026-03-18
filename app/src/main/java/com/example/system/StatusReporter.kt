@@ -5,6 +5,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import okhttp3.*
@@ -29,26 +31,44 @@ class StatusReporter(private val context: Context) {
     private val startTime = System.currentTimeMillis()
 
     /**
-     * 收集狀態並發送至伺服器
-     * @param uploadCount 目前成功上傳的圖片數量
-     * @param interval 當前拍照頻率 (秒)
-     * @param isStopping 是否正在停止服務 (最後遺言)
+     * 收集狀態並發送至伺服器 (非同步)
      */
-    fun sendHeartbeat(uploadCount: Int, interval: Int = 60, isStopping: Boolean = false) {
+    fun sendHeartbeat(uploadCount: Int, currentInterval: Int = 60, isStopping: Boolean = false) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping)
+        postJsonToServer(jsonPayload)
+    }
+
+    /**
+     * 💥 修正 3：同步發送最後遺言 (確保在進程關閉前送達)
+     */
+    fun sendHeartbeatSync(uploadCount: Int, currentInterval: Int, isStopping: Boolean) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping)
+        val body = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+        val request = Request.Builder().url(statusUrl).post(body).build()
+
+        try {
+            // 使用 execute() 而不是 enqueue()，強制等待結果
+            client.newCall(request).execute().use { response ->
+                Log.w("StatusReporter", "💀 遺言已確實抵達伺服器，狀態碼: ${response.code}")
+            }
+        } catch (e: Exception) {
+            Log.e("StatusReporter", "💀 遺言發送失敗", e)
+        }
+    }
+
+    private fun createPayload(uploadCount: Int, interval: Int, isStopping: Boolean): String {
         val batteryLevel = getBatteryLevel()
         val uptimeMinutes = (System.currentTimeMillis() - startTime) / (1000 * 60)
 
-        val jsonPayload = JSONObject().apply {
+        return JSONObject().apply {
             put("deviceId", deviceId)
             put("deviceName", deviceName)
             put("batteryLevel", batteryLevel)
             put("uploadCount", uploadCount)
-            put("interval", interval)
+            put("photoInterval", interval) // 伺服器依賴此 Key
             put("uptime", "${uptimeMinutes} 分鐘")
             put("isStopping", isStopping)
         }.toString()
-
-        postJsonToServer(jsonPayload)
     }
 
     private fun getBatteryLevel(): Int {
@@ -77,27 +97,29 @@ class StatusReporter(private val context: Context) {
 
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    if (!it.isSuccessful) {
-                        Log.e("StatusReporter", "⚠️ 心跳包被拒絕，狀態碼: ${it.code}")
-                        return
-                    }
+                    if (!it.isSuccessful) return
                     
-                    val responseData = it.body?.string()
-                    Log.d("StatusReporter", "💓 心跳包發送成功，回應: $responseData")
+                    val responseData = it.body?.string() ?: return
+                    Log.d("StatusReporter", "💓 心跳包發送成功")
                     
-                    // 解析 Server 回傳的指令 (如果有)
-                    if (!responseData.isNullOrBlank()) {
-                        try {
-                            val json = JSONObject(responseData)
-                            if (json.has("command")) {
-                                val command = json.getString("command")
-                                val value = json.optString("value", "")
+                    try {
+                        val json = JSONObject(responseData)
+                        if (json.has("command")) {
+                            val command = json.getString("command")
+                            val value = json.optString("value", "")
+                            Log.w("StatusReporter", "📥 收到伺服器指令: $command ($value)")
+                            
+                            // 💥 修正 2：強制在主執行緒執行指令，確保 Service 狀態正確切換
+                            Handler(Looper.getMainLooper()).post {
                                 onCommandReceived?.invoke(command, value)
                             }
-                        } catch (e: Exception) {
-                            // 非 JSON 格式或解析失敗，忽略
                         }
+                    } catch (e: Exception) {
+                        Log.e("StatusReporter", "❌ 解析伺服器回應失敗", e)
                     }
+                    // 確保 lambda 返回 Unit，避免 try/if 被誤判為表達式
+                    @Suppress("UNUSED_EXPRESSION")
+                    Unit
                 }
             }
         })

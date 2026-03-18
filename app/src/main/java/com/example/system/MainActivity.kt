@@ -17,10 +17,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.work.*
 import java.util.concurrent.TimeUnit
+import com.example.system.R
 
 class MainActivity : AppCompatActivity() {
 
-    private val TAG = "MainActivity"
+    private val tag = "MainActivity"
 
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -127,7 +128,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     startActivity(intent)
                 } catch (e: Exception) {
-                    Log.e(TAG, "無法跳轉: ${e.message}")
+                    Log.e(tag, "無法跳轉: ${e.message}")
                 }
             }
         }
