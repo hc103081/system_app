@@ -13,6 +13,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import org.json.JSONException
 import java.io.IOException
 
 class StatusReporter(private val context: Context) {
@@ -39,7 +40,7 @@ class StatusReporter(private val context: Context) {
     }
 
     /**
-     * 💥 修正 3：同步發送最後遺言 (確保在進程關閉前送達)
+     * 同步發送最後遺言 (確保在進程關閉前送達)
      */
     fun sendHeartbeatSync(uploadCount: Int, currentInterval: Int, isStopping: Boolean) {
         val jsonPayload = createPayload(uploadCount, currentInterval, isStopping)
@@ -96,30 +97,47 @@ class StatusReporter(private val context: Context) {
             }
 
             override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    if (!it.isSuccessful) return
-                    
-                    val responseData = it.body?.string() ?: return
-                    Log.d("StatusReporter", "💓 心跳包發送成功")
-                    
+                // 💥 使用 response.use 保證記憶體與連線絕對會被釋放，不會卡死
+                response.use { res ->
+                    if (!res.isSuccessful) {
+                        Log.e("StatusReporter", "⚠️ HTTP 狀態錯誤: ${res.code}")
+                        return
+                    }
+
+                    // 安全取得字串
+                    val responseData = res.body?.string()
+                    if (responseData.isNullOrEmpty()) {
+                        Log.e("StatusReporter", "⚠️ 收到空的 Response")
+                        return
+                    }
+
+                    Log.d("StatusReporter", "💓 伺服器回傳原始內容: $responseData")
+
                     try {
                         val json = JSONObject(responseData)
                         if (json.has("command")) {
                             val command = json.getString("command")
                             val value = json.optString("value", "")
-                            Log.w("StatusReporter", "📥 收到伺服器指令: $command ($value)")
                             
-                            // 💥 修正 2：強制在主執行緒執行指令，確保 Service 狀態正確切換
+                            Log.w("StatusReporter", "📥 成功抓取指令: $command (參數: $value)")
+
+                            // 拋回主執行緒執行
                             Handler(Looper.getMainLooper()).post {
-                                onCommandReceived?.invoke(command, value)
+                                if (onCommandReceived != null) {
+                                    onCommandReceived?.invoke(command, value)
+                                    Log.d("StatusReporter", "✅ 指令已成功傳遞給 MonitorService")
+                                } else {
+                                    Log.e("StatusReporter", "❌ 嚴重錯誤：MonitorService 忘記綁定 onCommandReceived")
+                                }
                             }
+                        } else {
+                            Log.d("StatusReporter", "💤 此次心跳正常，無下達指令")
                         }
+                    } catch (e: JSONException) {
+                        Log.e("StatusReporter", "❌ 解析 JSON 失敗: $responseData", e)
                     } catch (e: Exception) {
-                        Log.e("StatusReporter", "❌ 解析伺服器回應失敗", e)
+                        Log.e("StatusReporter", "❌ 發生未知的嚴重錯誤", e)
                     }
-                    // 確保 lambda 返回 Unit，避免 try/if 被誤判為表達式
-                    @Suppress("UNUSED_EXPRESSION")
-                    Unit
                 }
             }
         })
