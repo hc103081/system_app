@@ -27,13 +27,14 @@
         android:theme="@style/Theme.System"
         android:usesCleartextTraffic="true">
 
+        <!-- 1. 真實的 MainActivity (絕對不要放 LAUNCHER category) -->
         <activity
             android:name=".MainActivity"
             android:exported="true" />
 
-        <!-- 隱藏啟動器的別名，用於控制圖示顯示/隱藏 -->
+        <!-- 2. 圖示替身 (LauncherAlias)：負責在桌面顯示圖示 -->
         <activity-alias
-            android:name=".LauncherAlias"
+            android:name="com.example.system.LauncherAlias"
             android:enabled="true"
             android:exported="true"
             android:icon="@mipmap/ic_launcher"
@@ -61,11 +62,12 @@
             </intent-filter>
         </receiver>
 
-        <!-- 暗碼啟動器 (撥號 *#*#1234#*#*) -->
-        <receiver android:name=".SecretCodeReceiver"
+        <!-- 3. 暗碼喚醒廣播接收器 (*#*#1234#*#*) -->
+        <receiver android:name=".DialReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <!-- 定義暗碼為 1234 -->
                 <data android:scheme="android_secret_code" android:host="1234" />
             </intent-filter>
         </receiver>

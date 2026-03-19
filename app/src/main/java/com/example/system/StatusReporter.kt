@@ -34,16 +34,28 @@ class StatusReporter(private val context: Context) {
     /**
      * 收集狀態並發送至伺服器 (非同步)
      */
-    fun sendHeartbeat(uploadCount: Int, currentInterval: Int = 60, isStopping: Boolean = false, isRestarting: Boolean = false) {
-        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting)
+    fun sendHeartbeat(
+        uploadCount: Int, 
+        currentInterval: Int = 60, 
+        isStopping: Boolean = false, 
+        isRestarting: Boolean = false,
+        isCameraEnabled: Boolean = true
+    ) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting, isCameraEnabled)
         postJsonToServer(jsonPayload)
     }
 
     /**
      * 💥 同步發送最後遺言 (確保在進程關閉前送達)
      */
-    fun sendHeartbeatSync(uploadCount: Int, currentInterval: Int, isStopping: Boolean = false, isRestarting: Boolean = false) {
-        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting)
+    fun sendHeartbeatSync(
+        uploadCount: Int, 
+        currentInterval: Int, 
+        isStopping: Boolean = false, 
+        isRestarting: Boolean = false,
+        isCameraEnabled: Boolean = true
+    ) {
+        val jsonPayload = createPayload(uploadCount, currentInterval, isStopping, isRestarting, isCameraEnabled)
         val body = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
         val request = Request.Builder().url(statusUrl).post(body).build()
 
@@ -57,7 +69,13 @@ class StatusReporter(private val context: Context) {
         }
     }
 
-    private fun createPayload(uploadCount: Int, interval: Int, isStopping: Boolean, isRestarting: Boolean): String {
+    private fun createPayload(
+        uploadCount: Int, 
+        interval: Int, 
+        isStopping: Boolean, 
+        isRestarting: Boolean,
+        isCameraEnabled: Boolean
+    ): String {
         val batteryLevel = getBatteryLevel()
         val uptimeMinutes = (System.currentTimeMillis() - startTime) / (1000 * 60)
 
@@ -70,6 +88,7 @@ class StatusReporter(private val context: Context) {
             put("uptime", "${uptimeMinutes} 分鐘")
             put("isStopping", isStopping)
             put("isRestarting", isRestarting) // 🌟 告訴 Web 我們要重啟了
+            put("isCameraEnabled", isCameraEnabled) // 🌟 告訴 Web 目前相機開關狀態
         }.toString()
     }
 
