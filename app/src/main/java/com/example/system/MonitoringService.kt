@@ -3,11 +3,13 @@ package com.example.system
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.graphics.SurfaceTexture
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import android.view.Surface
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
@@ -224,17 +226,32 @@ class MonitoringService : LifecycleService() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            
+            // 🌟 許多裝置在背景拍照時，若沒有 Preview 流，快門會卡住 (等待 AE/AF 收斂)
+            // 建立一個不顯示的 Dummy Preview
+            val preview = Preview.Builder().build()
+            preview.setSurfaceProvider(cameraExecutor) { request ->
+                val surfaceTexture = SurfaceTexture(10) // 隨意 ID
+                surfaceTexture.setDefaultBufferSize(request.resolution.width, request.resolution.height)
+                val surface = Surface(surfaceTexture)
+                request.provideSurface(surface, cameraExecutor) {
+                    surface.release()
+                    surfaceTexture.release()
+                }
+            }
+
             val capture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY) // 改用品質模式通常較穩定
                 .build()
 
             val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, capture)
+                // 同時綁定 Preview 與 ImageCapture
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, capture)
                 imageCapture = capture
-                Log.d(TAG, "✅ CameraX 已成功綁定至服務生命週期")
+                Log.d(TAG, "✅ CameraX 已成功綁定 (含 Dummy Preview)")
             } catch (exc: Exception) {
                 Log.e(TAG, "❌ 相機啟動失敗", exc)
             }
@@ -242,9 +259,19 @@ class MonitoringService : LifecycleService() {
     }
 
     private fun takePhotoAndUpload() {
-        if (isCapturing || !isCameraEnabled) return
+        if (!isCameraEnabled) return
         
-        val imageCapture = imageCapture ?: return
+        if (isCapturing) {
+            Log.w(TAG, "⚠️ 拍照請求被跳過：上一次拍照尚未完成 (可能卡在快門)")
+            return
+        }
+        
+        val imageCapture = imageCapture
+        if (imageCapture == null) {
+            Log.e(TAG, "❌ 拍照失敗：imageCapture 為空")
+            return
+        }
+
         cleanUpOldFiles(cacheDir)
         
         isCapturing = true
@@ -253,22 +280,27 @@ class MonitoringService : LifecycleService() {
         val photoFile = File(cacheDir, "photo_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
 
-        imageCapture.takePicture(
-            outputOptions,
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    isCapturing = false
-                    Log.d(TAG, "✅ 拍照成功")
-                    uploadToServer(photoFile)
-                }
+        try {
+            imageCapture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        isCapturing = false
+                        Log.d(TAG, "✅ 拍照成功: ${photoFile.name}")
+                        uploadToServer(photoFile)
+                    }
 
-                override fun onError(exc: ImageCaptureException) {
-                    isCapturing = false
-                    Log.e(TAG, "❌ 拍照失敗: ${exc.message}")
+                    override fun onError(exc: ImageCaptureException) {
+                        isCapturing = false
+                        Log.e(TAG, "❌ 拍照失敗 [Code: ${exc.imageCaptureError}]: ${exc.message}", exc)
+                    }
                 }
-            }
-        )
+            )
+        } catch (e: Exception) {
+            isCapturing = false
+            Log.e(TAG, "❌ 呼叫 takePicture 發生異常", e)
+        }
     }
 
     private fun uploadToServer(file: File) {
